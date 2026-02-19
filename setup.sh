@@ -142,14 +142,55 @@ require_commands() {
     if [ ${#missing[@]} -ne 0 ]; then
         _warn "Отсутствуют команды: ${missing[*]}"
         if $AUTOINSTALL_PACKAGES; then
-            if ! apt-get update -y; then
+            # Обновляем список пакетов
+            if ! apt-get update -y 2>&1 | grep -qi "err:"; then
                 _warn "apt-get update завершился с предупреждениями, продолжаем..."
             fi
-            if ! apt-get install -y "${missing[@]}"; then
-                _error "Не удалось установить: ${missing[*]}"
-                return 1
+            
+            # Пытаемся установить команды по одной
+            local installed_cmds=()
+            local failed_cmds=()
+            
+            for cmd in "${missing[@]}"; do
+                # Определяем пакет по имени команды
+                local pkg="$cmd"
+                # Некоторые команды находятся в других пакетах
+                case "$cmd" in
+                    ip) pkg="iproute2" ;;
+                    ss) pkg="iproute2" ;;
+                    systemctl) pkg="systemd" ;;
+                    *) pkg="$cmd" ;;
+                esac
+                
+                if apt-get install -y "$pkg" 2>&1 | grep -qiE "(E:|Unable to locate|has no installation candidate)"; then
+                    _warn "Не удалось установить пакет $pkg для команды $cmd"
+                    failed_cmds+=("$cmd")
+                else
+                    # Проверяем что команда теперь доступна
+                    if command -v "$cmd" &>/dev/null; then
+                        installed_cmds+=("$cmd")
+                    else
+                        failed_cmds+=("$cmd")
+                    fi
+                fi
+            done
+            
+            if [ ${#installed_cmds[@]} -gt 0 ]; then
+                _success "Установлены: ${installed_cmds[*]}"
             fi
-            _success "Установлены: ${missing[*]}"
+            
+            if [ ${#failed_cmds[@]} -gt 0 ]; then
+                _warn "Не удалось установить команды: ${failed_cmds[*]}"
+                _print "Возможно нужен интернет-репозиторий"
+                # Для критичных команд возвращаем ошибку
+                local critical_cmds=("awk" "grep" "sed" "systemctl")
+                for cmd in "${critical_cmds[@]}"; do
+                    if [[ " ${failed_cmds[@]} " =~ " ${cmd} " ]]; then
+                        _error "Критичная команда $cmd недоступна"
+                        return 1
+                    fi
+                done
+            fi
         else
             _error "Установите недостающие пакеты вручную: apt update && apt install -y ${missing[*]}"
             return 1
@@ -172,6 +213,17 @@ command_exists() {
         fi
     done
     return 1
+}
+
+# Обёртка для apt-get install, которая всегда игнорирует CD-ROM
+# Использование: apt_get_install_no_cdrom --no-install-recommends --fix-missing package1 package2
+apt_get_install_no_cdrom() {
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Acquire::cdrom::mount=/dev/null \
+        -o Acquire::cdrom::always=false \
+        -o Acquire::cdrom::auto=false \
+        "$@"
+    return $?
 }
 
 # Бэкап файла (возвращает имя бэкапа или пусто)
@@ -313,14 +365,57 @@ check_and_install_packages() {
     if [ ${#need_install[@]} -ne 0 ]; then
         _warn "Отсутствуют пакеты: ${need_install[*]}"
         if $AUTOINSTALL_PACKAGES; then
-            if ! apt-get update -y; then
-                _warn "apt-get update завершился с предупреждениями, продолжаем..."
+            # Обновляем список пакетов
+            local update_output
+            update_output=$(apt-get update -y 2>&1)
+            local update_status=$?
+            
+            if [ $update_status -ne 0 ]; then
+                _warn "Обновление не удалось. Настройте интернет-репозитории в /etc/apt/sources.list"
             fi
-            if ! apt-get install -y "${need_install[@]}"; then
-                _error "Не удалось установить: ${need_install[*]}"
-                return 1
+            
+            # Пытаемся установить пакеты по одному, чтобы не прерывать при ошибке одного
+            local installed=()
+            local failed=()
+            
+            for pkg in "${need_install[@]}"; do
+                local install_output
+                install_output=$(DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" 2>&1)
+                if echo "$install_output" | grep -qiE "(E:|Unable to locate|has no installation candidate|Package.*is not available)"; then
+                    _warn "Пакет $pkg недоступен для установки (возможно нужен интернет-репозиторий)"
+                    failed+=("$pkg")
+                else
+                    # Проверяем что пакет действительно установился
+                    if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+                        installed+=("$pkg")
+                    else
+                        failed+=("$pkg")
+                    fi
+                fi
+            done
+            
+            if [ ${#installed[@]} -gt 0 ]; then
+                _success "Установлены пакеты: ${installed[*]}"
             fi
-            _success "Установлены пакеты: ${need_install[*]}"
+            
+            if [ ${#failed[@]} -gt 0 ]; then
+                _error "Не удалось установить: ${failed[*]}"
+                _print "Возможные решения:"
+                _print "1. Настройте интернет-репозитории в /etc/apt/sources.list"
+                _print "2. Установите пакеты вручную: apt install -y ${failed[*]}"
+                
+                # Для критичных пакетов возвращаем ошибку
+                local critical_pkgs=("sudo" "ufw" "ipcalc")
+                for pkg in "${critical_pkgs[@]}"; do
+                    if [[ " ${failed[@]} " =~ " ${pkg} " ]]; then
+                        _error "Критичный пакет $pkg не установлен - скрипт не может продолжить работу"
+                        return 1
+                    fi
+                done
+                
+                # Для остальных пакетов продолжаем с предупреждением
+                _warn "Продолжаем работу, но некоторые функции могут быть недоступны"
+            fi
         else
             _error "Установите пакеты вручную: apt update && apt install -y ${need_install[*]}"
             return 1
@@ -340,14 +435,376 @@ check_os_compatibility() {
     _success "ОС совместима: Debian/Ubuntu"
 }
 
+# Проверка и добавление интернет-репозиториев Debian/Ubuntu
+ensure_internet_repositories() {
+    local sources_file="/etc/apt/sources.list"
+    local has_internet_repos=false
+    local distro_codename
+    local distro_id
+    
+    # Определяем дистрибутив
+    if [ -f /etc/os-release ]; then
+        distro_id=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
+        distro_codename=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
+    fi
+    
+    # Если не удалось определить, пробуем через lsb_release
+    if [ -z "$distro_codename" ] && command -v lsb_release &>/dev/null; then
+        distro_codename=$(lsb_release -cs 2>/dev/null)
+        distro_id=$(lsb_release -is 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    fi
+    
+    # Если всё ещё не определили, пробуем через /etc/debian_version
+    if [ -z "$distro_codename" ] && [ -f /etc/debian_version ]; then
+        local debian_version
+        debian_version=$(cat /etc/debian_version)
+        # Для Debian пробуем определить кодовое имя
+        if echo "$debian_version" | grep -qi "bookworm"; then
+            distro_codename="bookworm"
+            distro_id="debian"
+        elif echo "$debian_version" | grep -qi "trixie"; then
+            distro_codename="trixie"
+            distro_id="debian"
+        elif echo "$debian_version" | grep -qi "bullseye"; then
+            distro_codename="bullseye"
+            distro_id="debian"
+        elif echo "$debian_version" | grep -qi "sid"; then
+            distro_codename="sid"
+            distro_id="debian"
+        fi
+    fi
+    
+    # Если всё ещё не определили, пробуем через /etc/apt/sources.list
+    if [ -z "$distro_codename" ] && [ -f /etc/apt/sources.list ]; then
+        # Ищем кодовое имя в существующих репозиториях
+        local found_codename
+        found_codename=$(grep -E "deb.*(bookworm|trixie|bullseye|sid|buster|stretch)" /etc/apt/sources.list 2>/dev/null | head -n1 | grep -oE "(bookworm|trixie|bullseye|sid|buster|stretch)" | head -n1)
+        if [ -n "$found_codename" ]; then
+            distro_codename="$found_codename"
+            distro_id="debian"
+        fi
+    fi
+    
+    # Удаляем все DVD/CD-ROM репозитории навсегда (привода на сервере не будет)
+    local cdrom_removed=false
+    
+    if [ -f "$sources_file" ]; then
+        if grep -qiE "cdrom://|cdrom|dvd" "$sources_file" 2>/dev/null; then
+            _print "Удаляем DVD/CD-ROM репозитории из sources.list..."
+            # Создаём бэкап перед удалением
+            cp "$sources_file" "${sources_file}.backup.before-cdrom-removal.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+            # Удаляем все строки с cdrom://, cdrom, dvd (включая закомментированные)
+            sed -i '/cdrom:\/\//Id' "$sources_file" 2>/dev/null || true
+            sed -i '/^[[:space:]]*#.*cdrom/Id' "$sources_file" 2>/dev/null || true
+            sed -i '/^[[:space:]]*deb.*cdrom/Id' "$sources_file" 2>/dev/null || true
+            sed -i '/^[[:space:]]*deb.*dvd/Id' "$sources_file" 2>/dev/null || true
+            cdrom_removed=true
+            _success "DVD/CD-ROM репозитории удалены из sources.list"
+        fi
+    fi
+    
+    # Удаляем DVD/CD-ROM репозитории из sources.list.d
+    if [ -d /etc/apt/sources.list.d ]; then
+        for file in /etc/apt/sources.list.d/*.list; do
+            if [ -f "$file" ] && grep -qiE "cdrom://|cdrom|dvd" "$file" 2>/dev/null; then
+                _print "Удаляем DVD/CD-ROM репозитории из $(basename "$file")..."
+                cp "$file" "${file}.backup.before-cdrom-removal.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+                sed -i '/cdrom:\/\//Id' "$file" 2>/dev/null || true
+                sed -i '/^[[:space:]]*#.*cdrom/Id' "$file" 2>/dev/null || true
+                sed -i '/^[[:space:]]*deb.*cdrom/Id' "$file" 2>/dev/null || true
+                sed -i '/^[[:space:]]*deb.*dvd/Id' "$file" 2>/dev/null || true
+                cdrom_removed=true
+                _success "DVD/CD-ROM репозитории удалены из $(basename "$file")"
+            fi
+        done
+    fi
+    
+    # Очищаем кэш CD-ROM из apt lists
+    rm -rf /var/lib/apt/lists/*cdrom* 2>/dev/null || true
+    rm -rf /var/lib/apt/lists/*dvd* 2>/dev/null || true
+    
+    # Если удалили CD-ROM репозитории, обновляем кэш apt
+    if [ "$cdrom_removed" = true ]; then
+        _print "Обновляем кэш apt после удаления DVD/CD-ROM репозиториев..."
+        apt-get update -qq 2>&1 | grep -vE "cdrom://|apt-cdrom" || true
+    fi
+    
+    # Проверяем наличие интернет-репозиториев
+    if [ -f "$sources_file" ]; then
+        if grep -qE "http://|https://|ftp://" "$sources_file" 2>/dev/null; then
+            has_internet_repos=true
+        fi
+    fi
+    
+    # Если нет интернет-репозиториев, добавляем стандартные
+    if [ "$has_internet_repos" = false ] && [ -n "$distro_codename" ]; then
+        _warn "Интернет-репозитории не найдены, добавляем стандартные..."
+        
+        # Создаём бэкап
+        if [ -f "$sources_file" ]; then
+            cp "$sources_file" "${sources_file}.backup.$(date +%Y%m%d_%H%M%S)"
+        fi
+        
+        # Добавляем стандартные репозитории Debian
+        if [ "$distro_id" = "debian" ]; then
+            {
+                echo ""
+                echo "# Debian internet repositories added by setup.sh"
+                echo "deb http://deb.debian.org/debian $distro_codename main contrib non-free"
+                echo "deb http://deb.debian.org/debian $distro_codename-updates main contrib non-free"
+                # Для testing/unstable используем другой путь для security
+                if [ "$distro_codename" = "sid" ] || [ "$distro_codename" = "trixie" ]; then
+                    echo "deb http://deb.debian.org/debian-security $distro_codename-security main contrib non-free"
+                else
+                    echo "deb http://security.debian.org/debian-security $distro_codename-security main contrib non-free"
+                fi
+            } >> "$sources_file"
+            _success "Добавлены стандартные Debian репозитории для $distro_codename"
+        # Добавляем стандартные репозитории Ubuntu
+        elif [ "$distro_id" = "ubuntu" ]; then
+            {
+                echo "# Ubuntu internet repositories added by setup.sh"
+                echo "deb http://archive.ubuntu.com/ubuntu $distro_codename main restricted universe multiverse"
+                echo "deb http://archive.ubuntu.com/ubuntu $distro_codename-updates main restricted universe multiverse"
+                echo "deb http://security.ubuntu.com/ubuntu $distro_codename-security main restricted universe multiverse"
+            } >> "$sources_file"
+            _success "Добавлены стандартные Ubuntu репозитории для $distro_codename"
+        else
+            _warn "Не удалось определить дистрибутив, добавляем базовые Debian репозитории"
+            {
+                echo "# Debian internet repositories added by setup.sh"
+                echo "deb http://deb.debian.org/debian stable main contrib non-free"
+                echo "deb http://deb.debian.org/debian stable-updates main contrib non-free"
+                echo "deb http://security.debian.org/debian-security stable-security main contrib non-free"
+            } >> "$sources_file"
+        fi
+        
+        # Обновляем список пакетов после добавления репозиториев
+        _print "Обновляем список пакетов..."
+        
+        local update_result
+        update_result=$(apt-get update -y 2>&1)
+        local update_status=$?
+        
+        if [ $update_status -eq 0 ]; then
+            _success "Список пакетов обновлён"
+        else
+            if echo "$update_result" | grep -qiE "(err:|E:)"; then
+                _warn "Обновление списка пакетов завершилось с предупреждениями"
+            else
+                _success "Список пакетов обновлён"
+            fi
+        fi
+        
+        log_action "Добавлены интернет-репозитории: $distro_id $distro_codename"
+        return 0
+    elif [ "$has_internet_repos" = true ]; then
+        _print "Интернет-репозитории уже настроены"
+        return 0
+    else
+        _warn "Не удалось определить дистрибутив для добавления репозиториев"
+        return 1
+    fi
+}
+
 check_requirements() {
     require_commands awk grep sed systemctl ip ssh df free || {
         _error "Недостаточно утилит"
         exit 1
     }
+    
+    # СНАЧАЛА удаляем все DVD/CD-ROM репозитории (привода на сервере не будет)
+    # Это должно произойти до любых операций с apt
+    local sources_file="/etc/apt/sources.list"
+    local cdrom_removed=false
+    
+    if [ -f "$sources_file" ]; then
+        if grep -qiE "cdrom://|cdrom|dvd" "$sources_file" 2>/dev/null; then
+            _print "Удаляем DVD/CD-ROM репозитории из sources.list..."
+            cp "$sources_file" "${sources_file}.backup.before-cdrom-removal.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+            sed -i '/cdrom:\/\//Id' "$sources_file" 2>/dev/null || true
+            sed -i '/^[[:space:]]*#.*cdrom/Id' "$sources_file" 2>/dev/null || true
+            sed -i '/^[[:space:]]*deb.*cdrom/Id' "$sources_file" 2>/dev/null || true
+            sed -i '/^[[:space:]]*deb.*dvd/Id' "$sources_file" 2>/dev/null || true
+            cdrom_removed=true
+            _success "DVD/CD-ROM репозитории удалены из sources.list"
+        fi
+    fi
+    
+    if [ -d /etc/apt/sources.list.d ]; then
+        for file in /etc/apt/sources.list.d/*.list; do
+            if [ -f "$file" ] && grep -qiE "cdrom://|cdrom|dvd" "$file" 2>/dev/null; then
+                _print "Удаляем DVD/CD-ROM репозитории из $(basename "$file")..."
+                cp "$file" "${file}.backup.before-cdrom-removal.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+                sed -i '/cdrom:\/\//Id' "$file" 2>/dev/null || true
+                sed -i '/^[[:space:]]*#.*cdrom/Id' "$file" 2>/dev/null || true
+                sed -i '/^[[:space:]]*deb.*cdrom/Id' "$file" 2>/dev/null || true
+                sed -i '/^[[:space:]]*deb.*dvd/Id' "$file" 2>/dev/null || true
+                cdrom_removed=true
+                _success "DVD/CD-ROM репозитории удалены из $(basename "$file")"
+            fi
+        done
+    fi
+    
+    # Очищаем кэш CD-ROM
+    rm -rf /var/lib/apt/lists/*cdrom* 2>/dev/null || true
+    rm -rf /var/lib/apt/lists/*dvd* 2>/dev/null || true
+    
+    # Если удалили CD-ROM, обновляем кэш apt
+    if [ "$cdrom_removed" = true ]; then
+        _print "Обновляем кэш apt после удаления DVD/CD-ROM репозиториев..."
+        apt-get update -qq 2>&1 | grep -vE "cdrom://|apt-cdrom" || true
+    fi
+    
+    # Проверяем и добавляем интернет-репозитории если нужно
+    local repos_added=false
+    if ensure_internet_repositories; then
+        repos_added=true
+    else
+        _warn "Продолжаем без добавления репозиториев..."
+    fi
+    
     # проверка critical packages (пассивная)
+    # Все эти пакеты обязательны и должны быть в репозиториях
     local critical=(openssh-server sudo passwd adduser locales ufw ipcalc)
-    check_and_install_packages "${critical[@]}"
+    
+    # Если репозитории только что добавлены, список пакетов уже обновлён
+    if [ "$repos_added" = true ]; then
+        _print "Устанавливаем критичные пакеты..."
+        # Устанавливаем пакеты напрямую, без повторного обновления
+        local need_install=()
+        for pkg in "${critical[@]}"; do
+            if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+                need_install+=("$pkg")
+            fi
+        done
+        
+        if [ ${#need_install[@]} -gt 0 ]; then
+            _print "Устанавливаем: ${need_install[*]}"
+            
+            # Проверяем и удаляем блокировки dpkg/apt
+            local lock_files=("/var/lib/dpkg/lock" "/var/lib/apt/lists/lock" "/var/cache/apt/archives/lock" "/var/lib/dpkg/lock-frontend")
+            
+            for lock_file in "${lock_files[@]}"; do
+                if [ -f "$lock_file" ]; then
+                    _warn "Обнаружена блокировка: $lock_file"
+                    
+                    # Проверяем, есть ли активный процесс, использующий блокировку
+                    local lock_pid=""
+                    if command -v lsof &>/dev/null; then
+                        lock_pid=$(lsof -t "$lock_file" 2>/dev/null | head -n1 || echo "")
+                    fi
+                    if [ -z "$lock_pid" ] && command -v fuser &>/dev/null; then
+                        lock_pid=$(fuser "$lock_file" 2>/dev/null | awk '{print $1}' | head -n1 || echo "")
+                    fi
+                    
+                    if [ -n "$lock_pid" ] && ps -p "$lock_pid" >/dev/null 2>&1; then
+                        _warn "Активный процесс использует блокировку (PID: $lock_pid)"
+                        _print "Завершаем процесс..."
+                        kill "$lock_pid" 2>/dev/null || true
+                        sleep 2
+                        # Проверяем ещё раз
+                        if ps -p "$lock_pid" >/dev/null 2>&1; then
+                            kill -9 "$lock_pid" 2>/dev/null || true
+                            sleep 1
+                        fi
+                    fi
+                    
+                    # Удаляем блокировку если процесс не найден или завершён
+                    if [ -f "$lock_file" ]; then
+                        lock_pid=""
+                        if command -v lsof &>/dev/null; then
+                            lock_pid=$(lsof -t "$lock_file" 2>/dev/null | head -n1 || echo "")
+                        fi
+                        if [ -z "$lock_pid" ] && command -v fuser &>/dev/null; then
+                            lock_pid=$(fuser "$lock_file" 2>/dev/null | awk '{print $1}' | head -n1 || echo "")
+                        fi
+                        
+                        if [ -z "$lock_pid" ] || ! ps -p "$lock_pid" >/dev/null 2>&1; then
+                            rm -f "$lock_file"
+                            _success "Блокировка удалена: $lock_file"
+                        else
+                            _error "Блокировка всё ещё используется процессом (PID: $lock_pid)"
+                            _print "Выполните вручную: sudo kill $lock_pid && sudo rm -f $lock_file"
+                            return 1
+                        fi
+                    fi
+                fi
+            done
+            
+            # Проверяем интернет перед установкой
+            _print "Проверка интернет-соединения..."
+            if ! ping -c1 -W2 8.8.8.8 &>/dev/null && ! ping -c1 -W2 1.1.1.1 &>/dev/null; then
+                if command -v curl &>/dev/null; then
+                    if ! curl -s --connect-timeout 5 http://ifconfig.me >/dev/null 2>&1; then
+                        _error "Интернет недоступен, не могу установить пакеты"
+                        return 1
+                    fi
+                else
+                    _error "Интернет недоступен, не могу установить пакеты"
+                    return 1
+                fi
+            fi
+            _success "Интернет доступен"
+            
+            # Используем timeout и DEBIAN_FRONTEND=noninteractive
+            _print "Начинаем установку пакетов..."
+            
+            local install_output
+            local install_status
+            
+            # Устанавливаем пакеты с выводом прогресса
+            # Используем флаги для избежания интерактивных запросов и обновления списка
+            export DEBIAN_FRONTEND=noninteractive
+            export APT_LISTCHANGES_FRONTEND=none
+            
+            # Важно: используем --no-update чтобы не обновлять список пакетов (уже обновлён)
+            # и --fix-missing для автоматического исправления проблем
+            _print "Устанавливаем: ${need_install[*]}"
+            
+            # Временно отключаем строгий режим для этой команды
+            set +e
+            _print "Устанавливаем пакеты..."
+            _print "Вывод установки:"
+            echo "---"
+            # Используем флаги для избежания интерактивных запросов
+            export DEBIAN_FRONTEND=noninteractive
+            export APT_LISTCHANGES_FRONTEND=none
+            # Используем функцию-обёртку, которая игнорирует CD-ROM
+            apt_get_install_no_cdrom --no-install-recommends --fix-missing "${need_install[@]}"
+            install_status=$?
+            echo "---"
+            set -e
+            
+            # Проверяем результат установки
+            if [ $install_status -ne 0 ]; then
+                _error "Установка завершилась с ошибкой (код: $install_status)"
+                return 1
+            fi
+            
+            # Проверяем что пакеты действительно установились
+            local all_installed=true
+            set +e
+            for pkg in "${need_install[@]}"; do
+                if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+                    _warn "Пакет $pkg не установлен после установки"
+                    all_installed=false
+                fi
+            done
+            set -e
+            
+            if [ "$all_installed" = true ]; then
+                _success "Установлены пакеты: ${need_install[*]}"
+            else
+                _warn "Некоторые пакеты не установлены корректно"
+                return 1
+            fi
+        else
+            _success "Все критичные пакеты уже установлены"
+        fi
+    else
+        check_and_install_packages "${critical[@]}"
+    fi
 }
 
 check_internet() {
@@ -477,6 +934,20 @@ add_ufw_port() {
     ensure_ufw_installed || return 1
     local port protocol comment
     
+    # Проверяем статус UFW перед добавлением порта
+    local ufw_status
+    ufw_status=$(run_sbin_cmd ufw status 2>/dev/null | head -n1)
+    if echo "$ufw_status" | grep -qi "inactive"; then
+        _warn "UFW неактивен. Правила добавлены, но не будут применяться до включения UFW."
+        if ask_yes_no "Включить UFW сейчас?" "yes"; then
+            if run_sbin_cmd ufw --force enable; then
+                _success "UFW включён"
+            else
+                _warn "Не удалось включить UFW. Правила будут добавлены, но не применятся."
+            fi
+        fi
+    fi
+    
     while true; do
         read_input "Введите порт (1-65535)" port
         if validate_port "$port"; then
@@ -549,6 +1020,13 @@ add_ufw_port() {
                 return 1
             fi
         fi
+    fi
+    
+    # Проверяем статус UFW после добавления порта
+    ufw_status=$(run_sbin_cmd ufw status 2>/dev/null | head -n1)
+    if echo "$ufw_status" | grep -qi "inactive"; then
+        _warn "ВНИМАНИЕ: UFW неактивен. Правила добавлены, но не применяются."
+        _print "Используйте пункт меню '4) Включить/отключить UFW' для активации."
     fi
 }
 
@@ -664,7 +1142,8 @@ toggle_ufw() {
     local status
     status=$(run_sbin_cmd ufw status 2>/dev/null | head -n1)
     
-    if echo "$status" | grep -qi active; then
+    # Проверяем статус: "Status: active" или "Status: inactive"
+    if echo "$status" | grep -qiE "Status:.*active" && ! echo "$status" | grep -qi "inactive"; then
         if ask_yes_no "UFW активен. Отключить?" "no"; then
             if run_sbin_cmd ufw --force disable; then
                 _success "UFW отключён"
