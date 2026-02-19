@@ -18,7 +18,7 @@
 
 1. Скачайте скрипт:
 ```bash
-wget https://github.com/user-attachments/files/23857250/setup.sh
+wget https://your-server/setup.sh
 # или скопируйте файл на сервер
 ```
 
